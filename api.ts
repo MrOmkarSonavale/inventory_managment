@@ -1,116 +1,119 @@
-// src/routes/alerts.ts
-import { Router, Request, Response } from "express";
+// routes/alerts.js
+import { Router } from "express";
 import { Pool } from "pg";
 
-const router = Router();
+const alertsRouter = Router();
 
-export default (pool: Pool) => {
-  router.get(
+export default function initAlertsRoutes(db: Pool) {
+  alertsRouter.get(
     "/api/companies/:companyId/alerts/low-stock",
-    async (req: Request, res: Response) => {
-      const companyId = Number(req.params.companyId);
-      const days = Math.max(1, Math.min(365, Number(req.query.days) || 30)); // default 30 days
+    async (req, res) => {
+      const companyId = parseInt(req.params.companyId, 10);
+      const daysWindow = parseInt(req.query.days as string, 10) || 30;
 
-      if (!Number.isFinite(companyId)) {
-        return res.status(400).json({ error: "Invalid companyId" });
+      if (!Number.isInteger(companyId) || companyId <= 0) {
+        return res.status(400).json({ error: "Invalid company_id" });
       }
 
-      try {
-        const client = await pool.connect();
-        try {
-          const { rows } = await client.query(
-            `
-            WITH recent_sales AS (
-              SELECT soi.product_id,
-                     SUM(soi.quantity) AS sold_qty
-              FROM sales_order_items soi
-              JOIN sales_orders so ON so.id = soi.sales_order_id
-              WHERE so.company_id = $1
-                AND so.created_at >= now() - ($2 || ' days')::interval
-              GROUP BY soi.product_id
-            ),
-            thresholds AS (
-              SELECT i.product_id,
-                     i.warehouse_id,
-                     COALESCE(i.reorder_point, pt.default_low_stock_threshold, 0) AS threshold
-              FROM inventories i
-              JOIN warehouses w ON w.id = i.warehouse_id AND w.company_id = $1
-              JOIN products p ON p.id = i.product_id
-              LEFT JOIN product_types pt ON pt.name = p.product_type
-            ),
-            base AS (
-              SELECT p.id AS product_id,
-                     p.name AS product_name,
-                     p.sku,
-                     w.id AS warehouse_id,
-                     w.name AS warehouse_name,
-                     i.quantity AS current_stock,
-                     t.threshold,
-                     rs.sold_qty
-              FROM thresholds t
-              JOIN inventories i ON i.product_id = t.product_id AND i.warehouse_id = t.warehouse_id
-              JOIN warehouses w ON w.id = i.warehouse_id
-              JOIN products p ON p.id = i.product_id
-              LEFT JOIN recent_sales rs ON rs.product_id = p.id
-            ),
-            filtered AS (
-              SELECT * FROM base
-              WHERE COALESCE(sold_qty, 0) > 0  -- recent sales activity
-                AND current_stock < threshold  -- low stock
-            ),
-            sales_rate AS (
-              SELECT product_id,
-                     (COALESCE(sold_qty, 0)::numeric / $2::numeric) AS avg_daily_sales
-              FROM recent_sales
-            ),
-            supplier_choice AS (
-              SELECT sp.product_id,
-                     sp.supplier_id,
-                     s.name,
-                     s.contact_email,
-                     ROW_NUMBER() OVER (
-                       PARTITION BY sp.product_id
-                       ORDER BY (CASE WHEN sp.is_primary THEN 0 ELSE 1 END),
-                                sp.lead_time_days NULLS LAST
-                     ) AS rn
-              FROM supplier_products sp
-              JOIN suppliers s ON s.id = sp.supplier_id
-            )
-            SELECT f.product_id,
-                   f.product_name,
-                   f.sku,
-                   f.warehouse_id,
-                   f.warehouse_name,
-                   f.current_stock::float AS current_stock,
-                   f.threshold,
-                   CASE 
-                     WHEN COALESCE(sr.avg_daily_sales, 0) = 0 THEN NULL
-                     ELSE ROUND(f.current_stock / sr.avg_daily_sales, 2)
-                   END AS days_until_stockout,
-                   jsonb_build_object(
-                     'id', sc.supplier_id,
-                     'name', sc.name,
-                     'contact_email', sc.contact_email
-                   ) AS supplier
-            FROM filtered f
-            LEFT JOIN sales_rate sr ON sr.product_id = f.product_id
-            LEFT JOIN supplier_choice sc 
-              ON sc.product_id = f.product_id AND sc.rn = 1
-            ORDER BY (f.threshold - f.current_stock) DESC, f.product_name
-            `,
-            [companyId, days]
-          );
+      if (daysWindow < 1 || daysWindow > 365) {
+        return res
+          .status(400)
+          .json({ error: "Days parameter must be between 1 and 365" });
+      }
 
-          res.json({ alerts: rows, total_alerts: rows.length });
-        } finally {
-          client.release();
-        }
+      const sql = `
+      WITH sales_window AS (
+        SELECT soi.product_id,
+               SUM(soi.quantity) AS total_sold
+        FROM sales_order_items soi
+        JOIN sales_orders so ON so.id = soi.sales_order_id
+        WHERE so.company_id = $1
+          AND so.created_at >= now() - ($2 || ' days')::interval
+        GROUP BY soi.product_id
+      ),
+      threshold_lookup AS (
+        SELECT i.product_id,
+               i.warehouse_id,
+               COALESCE(i.reorder_point, pt.default_low_stock_threshold, 0) AS threshold
+        FROM inventories i
+        JOIN warehouses w ON w.id = i.warehouse_id
+        JOIN products p ON p.id = i.product_id
+        LEFT JOIN product_types pt ON pt.id = p.product_type_id
+        WHERE w.company_id = $1
+      ),
+      base_data AS (
+        SELECT p.id AS product_id,
+               p.name AS product_name,
+               p.sku,
+               w.id AS warehouse_id,
+               w.name AS warehouse_name,
+               i.quantity AS current_stock,
+               t.threshold,
+               sw.total_sold
+        FROM inventories i
+        JOIN warehouses w ON w.id = i.warehouse_id
+        JOIN products p ON p.id = i.product_id
+        JOIN threshold_lookup t
+          ON t.product_id = i.product_id AND t.warehouse_id = i.warehouse_id
+        LEFT JOIN sales_window sw ON sw.product_id = p.id
+      ),
+      filtered AS (
+        SELECT * FROM base_data
+        WHERE COALESCE(total_sold, 0) > 0
+          AND current_stock < threshold
+      ),
+      sales_rates AS (
+        SELECT product_id,
+               (total_sold::numeric / $2::numeric) AS avg_daily_sales
+        FROM sales_window
+      ),
+      supplier_ranked AS (
+        SELECT sp.product_id,
+               sp.supplier_id,
+               s.name,
+               s.contact_email,
+               ROW_NUMBER() OVER (
+                 PARTITION BY sp.product_id
+                 ORDER BY CASE WHEN sp.is_primary THEN 0 ELSE 1 END,
+                          sp.lead_time_days NULLS LAST
+               ) AS rn
+        FROM supplier_products sp
+        JOIN suppliers s ON s.id = sp.supplier_id
+      )
+      SELECT f.product_id,
+             f.product_name,
+             f.sku,
+             f.warehouse_id,
+             f.warehouse_name,
+             f.current_stock::float,
+             f.threshold,
+             CASE
+               WHEN sr.avg_daily_sales IS NULL OR sr.avg_daily_sales = 0 THEN NULL
+               ELSE ROUND(f.current_stock / sr.avg_daily_sales, 2)
+             END AS days_until_stockout,
+             jsonb_build_object(
+               'id', sup.supplier_id,
+               'name', sup.name,
+               'contact_email', sup.contact_email
+             ) AS supplier
+      FROM filtered f
+      LEFT JOIN sales_rates sr ON sr.product_id = f.product_id
+      LEFT JOIN supplier_ranked sup ON sup.product_id = f.product_id AND sup.rn = 1
+      ORDER BY (f.threshold - f.current_stock) DESC, f.product_name;
+    `;
+
+      try {
+        const { rows } = await db.query(sql, [companyId, daysWindow]);
+        res.json({
+          alerts: rows,
+          total_alerts: rows.length,
+        });
       } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Internal server error" });
+        console.error("Error fetching low-stock alerts:", err);
+        res.status(500).json({ error: "Failed to fetch alerts" });
       }
     }
   );
 
-  return router;
-};
+  return alertsRouter;
+}
